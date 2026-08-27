@@ -50,10 +50,19 @@ from AILab_Utils import (
     CUSTOM_MODELS_PATH,
     HF_CONFIG_PATH,
     SYSTEM_PROMPTS_PATH,
+    ENABLE_DISABLE,
     load_system_prompts,
     tensor_to_pil,
     sample_video_frames,
     resolve_safe_video_max_side,
+    collect_labeled_images,
+    collect_labeled_videos,
+    collect_audio_notes,
+    build_media_user_prompt,
+    compose_system_prompt,
+    resolve_user_prompt,
+    format_history_block,
+    flag_enabled,
 )
 
 NODE_DIR = PLUGIN_DIR
@@ -551,6 +560,8 @@ class QwenVLBase:
         self.processor = None
         self.tokenizer = None
         self.current_signature = None
+        self.conversation_memory = []
+        self.last_response = ""
         print(f"[QwenVL] Node on {self.device_info['device_type']}")
 
     def clear(self):
@@ -790,27 +801,42 @@ class QwenVLBase:
         num_beams,
         repetition_penalty,
         video_frame_size="auto",
+        labeled_images=None,
+        labeled_videos=None,
+        system_prompt="",
+        audio_notes=None,
     ):
-        conversation = [{"role": "user", "content": []}]
-        if image is not None:
-            conversation[0]["content"].append({"type": "image", "image": tensor_to_pil(image, max_side=1280)})
-        if video is not None:
+        user_content = []
+        images = labeled_images if labeled_images is not None else ([("Image 1", image)] if image is not None else [])
+        videos = labeled_videos if labeled_videos is not None else ([("Video 1", video)] if video is not None else [])
+        for label, tensor in images:
+            pil = tensor_to_pil(tensor, max_side=1280)
+            if pil is not None:
+                user_content.append({"type": "text", "text": f"[{label}]"})
+                user_content.append({"type": "image", "image": pil})
+        for label, tensor in videos:
             video_max_side = resolve_safe_video_max_side(
-                video,
+                tensor,
                 frame_count=int(frame_count),
                 ctx=8192,
                 video_frame_size=video_frame_size,
             )
-            frames = sample_video_frames(video, int(frame_count))
+            frames = sample_video_frames(tensor, int(frame_count))
             pil_frames = [tensor_to_pil(frame, max_side=video_max_side) for frame in frames]
             pil_frames = [f for f in pil_frames if f is not None]
             if pil_frames:
-                conversation[0]["content"].append({"type": "video", "video": pil_frames})
-        conversation[0]["content"].append({"type": "text", "text": prompt_text})
+                user_content.append({"type": "text", "text": f"[{label}] ({len(pil_frames)} frames)"})
+                user_content.append({"type": "video", "video": pil_frames})
+        user_content.append({"type": "text", "text": prompt_text})
+        conversation = []
+        sys_text = (system_prompt or "").strip()
+        if sys_text:
+            conversation.append({"role": "system", "content": [{"type": "text", "text": sys_text}]})
+        conversation.append({"role": "user", "content": user_content})
         chat = self.processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
-        images = [item["image"] for item in conversation[0]["content"] if item["type"] == "image"]
-        video_frames = [frame for item in conversation[0]["content"] if item["type"] == "video" for frame in item["video"]]
-        videos = [video_frames] if video_frames else None
+        user_turn = conversation[-1]["content"]
+        images = [item["image"] for item in user_turn if item["type"] == "image"]
+        videos = [item["video"] for item in user_turn if item["type"] == "video"] or None
         processed = self.processor(text=chat, images=images or None, videos=videos, return_tensors="pt")
         model_device = next(self.model.parameters()).device
         model_inputs = {
@@ -872,6 +898,7 @@ class QwenVLBase:
                 num_beams,
                 repetition_penalty,
                 video_frame_size=video_frame_size,
+                system_prompt=compose_system_prompt(),
             )
             
             pbar.update_absolute(3, 3, None)
@@ -945,9 +972,20 @@ class AILab_QwenVL_Advanced(QwenVLBase):
                 "use_torch_compile": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["use_torch_compile"]}),
                 "device": (device_options, {"default": "auto", "tooltip": TOOLTIPS["device"]}),
                 "preset_prompt": (prompts, {"default": default_prompt, "tooltip": TOOLTIPS["preset_prompt"]}),
+                "system_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": "Custom system prompt. Leave empty for the default VL assistant prompt."}),
+                "user_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": "User instruction. If filled, this is used instead of preset/custom prompt."}),
                 "custom_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": TOOLTIPS["custom_prompt"]}),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.1, "max": 1.0, "tooltip": TOOLTIPS["temperature"]}),
+                "is_memory": (ENABLE_DISABLE, {"default": "disable", "tooltip": "When enable, keep prior turns on this node instance."}),
+                "is_tools_in_sys_prompt": (ENABLE_DISABLE, {"default": "disable"}),
+                "is_locked": (ENABLE_DISABLE, {"default": "disable", "tooltip": "When enable, skip generation and return the last response."}),
+                "main_brain": (ENABLE_DISABLE, {"default": "enable"}),
+                "max_length": ("INT", {"default": 1920, "min": 64, "max": 8192, "tooltip": "Maximum new tokens (same role as max_tokens)."}),
                 "max_tokens": ("INT", {"default": 512, "min": 64, "max": 4096, "tooltip": TOOLTIPS["max_tokens"]}),
-                "temperature": ("FLOAT", {"default": 0.6, "min": 0.1, "max": 1.0, "tooltip": TOOLTIPS["temperature"]}),
+                "conversation_rounds": ("INT", {"default": 1, "min": 1, "max": 32}),
+                "historical_record": ("STRING", {"default": "", "multiline": True}),
+                "is_enable": ("BOOLEAN", {"default": True}),
+                "stream": ("BOOLEAN", {"default": False, "tooltip": "Local HF generate still runs as one completion; kept for LLM-node compatibility."}),
                 "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "tooltip": TOOLTIPS["top_p"]}),
                 "num_beams": ("INT", {"default": 1, "min": 1, "max": 8, "tooltip": TOOLTIPS["num_beams"]}),
                 "repetition_penalty": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.0, "tooltip": TOOLTIPS["repetition_penalty"]}),
@@ -958,7 +996,19 @@ class AILab_QwenVL_Advanced(QwenVLBase):
             },
             "optional": {
                 "image": ("IMAGE",),
+                "image1": ("IMAGE",),
+                "image2": ("IMAGE",),
+                "image3": ("IMAGE",),
+                "image4": ("IMAGE",),
+                "image5": ("IMAGE",),
                 "video": ("IMAGE",),
+                "video1": ("IMAGE",),
+                "video2": ("IMAGE",),
+                "video3": ("IMAGE",),
+                "audio": ("AUDIO",),
+                "audio1": ("AUDIO",),
+                "audio2": ("AUDIO",),
+                "audio3": ("AUDIO",),
             },
         }
 
@@ -967,8 +1017,113 @@ class AILab_QwenVL_Advanced(QwenVLBase):
     FUNCTION = "process"
     CATEGORY = "🧪AILab/QwenVL"
 
-    def process(self, model_name, quantization, attention_mode, use_torch_compile, device, preset_prompt, custom_prompt, max_tokens, temperature, top_p, num_beams, repetition_penalty, frame_count, video_frame_size, keep_model_loaded, seed, image=None, video=None):
-        return self.run(model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, attention_mode, use_torch_compile, device, video_frame_size=video_frame_size)
+    def process(
+        self,
+        model_name,
+        quantization,
+        attention_mode,
+        use_torch_compile,
+        device,
+        preset_prompt,
+        system_prompt,
+        user_prompt,
+        custom_prompt,
+        temperature,
+        is_memory,
+        is_tools_in_sys_prompt,
+        is_locked,
+        main_brain,
+        max_length,
+        max_tokens,
+        conversation_rounds,
+        historical_record,
+        is_enable,
+        stream,
+        top_p,
+        num_beams,
+        repetition_penalty,
+        frame_count,
+        video_frame_size,
+        keep_model_loaded,
+        seed,
+        image=None,
+        image1=None,
+        image2=None,
+        image3=None,
+        image4=None,
+        image5=None,
+        video=None,
+        video1=None,
+        video2=None,
+        video3=None,
+        audio=None,
+        audio1=None,
+        audio2=None,
+        audio3=None,
+    ):
+        if not is_enable:
+            return ("",)
+        if flag_enabled(is_locked) and self.last_response:
+            return (self.last_response,)
+
+        labeled_images = collect_labeled_images(
+            image=image, image1=image1, image2=image2, image3=image3, image4=image4, image5=image5
+        )
+        labeled_videos = collect_labeled_videos(video=video, video1=video1, video2=video2, video3=video3)
+        audio_notes = collect_audio_notes(audio=audio, audio1=audio1, audio2=audio2, audio3=audio3)
+        user_text = resolve_user_prompt(preset_prompt, custom_prompt, user_prompt, SYSTEM_PROMPTS)
+        history = self.conversation_memory if flag_enabled(is_memory) else []
+        history_block = format_history_block(historical_record, history, conversation_rounds)
+        prompt_text = build_media_user_prompt(
+            (history_block + "\n\n" + user_text).strip() if history_block else user_text,
+            [lab for lab, _ in labeled_images],
+            [lab for lab, _ in labeled_videos],
+            audio_notes,
+        )
+        sys_text = compose_system_prompt(
+            system_prompt=system_prompt,
+            main_brain=main_brain,
+            is_tools_in_sys_prompt=is_tools_in_sys_prompt,
+        )
+        token_budget = int(max_length) if int(max_length or 0) > 0 else int(max_tokens)
+
+        pbar = ProgressBar(3)
+        torch.manual_seed(seed)
+        pbar.update_absolute(1, 3, None)
+        self.load_model(
+            model_name,
+            quantization,
+            attention_mode,
+            use_torch_compile,
+            device,
+            keep_model_loaded,
+        )
+        pbar.update_absolute(2, 3, None)
+        try:
+            text = self.generate(
+                prompt_text,
+                None,
+                None,
+                frame_count,
+                token_budget,
+                temperature,
+                top_p,
+                num_beams,
+                repetition_penalty,
+                video_frame_size=video_frame_size,
+                labeled_images=labeled_images,
+                labeled_videos=labeled_videos,
+                system_prompt=sys_text,
+            )
+            pbar.update_absolute(3, 3, None)
+            self.last_response = text
+            if flag_enabled(is_memory):
+                self.conversation_memory.append({"user": user_text, "assistant": text})
+            _ = stream
+            return (text,)
+        finally:
+            if not keep_model_loaded:
+                self.clear()
 
 NODE_CLASS_MAPPINGS = {
     "AILab_QwenVL": AILab_QwenVL,

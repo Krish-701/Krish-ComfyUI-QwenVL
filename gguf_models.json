@@ -149,13 +149,14 @@
         "pool_size": 4194304
       }
     },
-    "Qwen3.8-27B-UD-GGUF": {
+    "Qwen3.8-27B-GGUF": {
       "author": "unsloth",
       "repo_name": "Qwen3.8-27B-GGUF",
       "repo_id": "unsloth/Qwen3.8-27B-GGUF",
       "mmproj_file": "mmproj-BF16.gguf",
       "model_files": [
-        "Qwen3.8-27B-UD-Q3_K_XL.gguf"
+        "Qwen3.8-27B-Q4_0.gguf",
+        "Qwen3.8-27B-Q8_0.gguf"
       ],
       "defaults": {
         "context_length": 8192,

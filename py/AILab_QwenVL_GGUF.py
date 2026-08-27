@@ -32,6 +32,7 @@ from AILab_Utils import (
     PLUGIN_DIR,
     GGUF_CONFIG_PATH,
     CUSTOM_MODELS_PATH,
+    ENABLE_DISABLE,
     safe_dirname,
     resolve_base_dir,
     find_local_gguf_file,
@@ -42,6 +43,14 @@ from AILab_Utils import (
     tensor_to_base64_png,
     sample_video_frames,
     resolve_safe_video_max_side,
+    collect_labeled_images,
+    collect_labeled_videos,
+    collect_audio_notes,
+    build_media_user_prompt,
+    compose_system_prompt,
+    resolve_user_prompt,
+    format_history_block,
+    flag_enabled,
 )
 
 _prompts = load_system_prompts()
@@ -238,6 +247,8 @@ class QwenVLGGUFBase:
         self.llm = None
         self.chat_handler = None
         self.current_signature = None
+        self.conversation_memory = []
+        self.last_response = ""
 
     def clear(self):
         self.llm = None
@@ -457,19 +468,27 @@ class QwenVLGGUFBase:
         top_p: float,
         repetition_penalty: float,
         seed: int,
+        labeled_b64: list | None = None,
+        stream: bool = False,
     ) -> str:
-        if images_b64 and self.chat_handler is not None:
-            content = [{"type": "text", "text": user_prompt}]
-            for img in images_b64:
+        labeled = labeled_b64 or []
+        if not labeled and images_b64:
+            labeled = [("image", "Image", img) for img in images_b64 if img]
+
+        if labeled and self.chat_handler is not None:
+            content = []
+            for _kind, label, img in labeled:
                 if not img:
                     continue
+                content.append({"type": "text", "text": f"[{label}]"})
                 content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}"}})
+            content.append({"type": "text", "text": user_prompt})
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": content},
             ]
         else:
-            if images_b64 and self.chat_handler is None:
+            if labeled and self.chat_handler is None:
                 print("[QwenVL] Warning: Image provided but model has no visual projector (mmproj); running in text-only mode.")
             messages = [
                 {"role": "system", "content": system_prompt},
@@ -477,7 +496,7 @@ class QwenVLGGUFBase:
             ]
 
         start = time.perf_counter()
-        result = self.llm.create_chat_completion(
+        completion_kwargs = dict(
             messages=messages,
             max_tokens=int(max_tokens),
             temperature=float(temperature),
@@ -486,23 +505,34 @@ class QwenVLGGUFBase:
             seed=int(seed),
             stop=["<|im_end|>", "<|im_start|>"],
         )
-        elapsed = max(time.perf_counter() - start, 1e-6)
+        if stream:
+            pieces = []
+            for part in self.llm.create_chat_completion(**completion_kwargs, stream=True):
+                delta = ((part.get("choices") or [{}])[0].get("delta") or {}).get("content") or ""
+                if delta:
+                    pieces.append(delta)
+            elapsed = max(time.perf_counter() - start, 1e-6)
+            print(f"[QwenVL] Stream complete in {elapsed:.2f}s")
+            raw = "".join(pieces)
+        else:
+            result = self.llm.create_chat_completion(**completion_kwargs)
+            elapsed = max(time.perf_counter() - start, 1e-6)
 
-        usage = result.get("usage") or {}
-        prompt_tokens = usage.get("prompt_tokens")
-        completion_tokens = usage.get("completion_tokens")
-        if isinstance(completion_tokens, int) and completion_tokens > 0:
-            tok_s = completion_tokens / elapsed
-            if isinstance(prompt_tokens, int) and prompt_tokens >= 0:
-                print(
-                    f"[QwenVL] Tokens: prompt={prompt_tokens}, completion={completion_tokens}, "
-                    f"time={elapsed:.2f}s, speed={tok_s:.2f} tok/s"
-                )
-            else:
-                print(f"[QwenVL] Tokens: completion={completion_tokens}, time={elapsed:.2f}s, speed={tok_s:.2f} tok/s")
+            usage = result.get("usage") or {}
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
+            if isinstance(completion_tokens, int) and completion_tokens > 0:
+                tok_s = completion_tokens / elapsed
+                if isinstance(prompt_tokens, int) and prompt_tokens >= 0:
+                    print(
+                        f"[QwenVL] Tokens: prompt={prompt_tokens}, completion={completion_tokens}, "
+                        f"time={elapsed:.2f}s, speed={tok_s:.2f} tok/s"
+                    )
+                else:
+                    print(f"[QwenVL] Tokens: completion={completion_tokens}, time={elapsed:.2f}s, speed={tok_s:.2f} tok/s")
 
-        content = (result.get("choices") or [{}])[0].get("message", {}).get("content", "")
-        cleaned = clean_model_output(str(content or ""), OutputCleanConfig(mode="text"))
+            raw = (result.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        cleaned = clean_model_output(str(raw or ""), OutputCleanConfig(mode="text"))
         return cleaned.strip()
 
     def run(
@@ -682,9 +712,20 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
                 "model_name": (model_keys, {"default": default_model}),
                 "device": (device_options, {"default": "auto"}),
                 "preset_prompt": (prompts, {"default": default_prompt}),
+                "system_prompt": ("STRING", {"default": "", "multiline": True}),
+                "user_prompt": ("STRING", {"default": "", "multiline": True}),
                 "custom_prompt": ("STRING", {"default": "", "multiline": True}),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0}),
+                "is_memory": (ENABLE_DISABLE, {"default": "disable"}),
+                "is_tools_in_sys_prompt": (ENABLE_DISABLE, {"default": "disable"}),
+                "is_locked": (ENABLE_DISABLE, {"default": "disable"}),
+                "main_brain": (ENABLE_DISABLE, {"default": "enable"}),
+                "max_length": ("INT", {"default": 1920, "min": 64, "max": 8192}),
                 "max_tokens": ("INT", {"default": 512, "min": 64, "max": 4096}),
-                "temperature": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 2.0}),
+                "conversation_rounds": ("INT", {"default": 1, "min": 1, "max": 32}),
+                "historical_record": ("STRING", {"default": "", "multiline": True}),
+                "is_enable": ("BOOLEAN", {"default": True}),
+                "stream": ("BOOLEAN", {"default": False}),
                 "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0}),
                 "repetition_penalty": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.0}),
                 "frame_count": ("INT", {"default": 16, "min": 1, "max": 64}),
@@ -700,7 +741,19 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
             },
             "optional": {
                 "image": ("IMAGE",),
+                "image1": ("IMAGE",),
+                "image2": ("IMAGE",),
+                "image3": ("IMAGE",),
+                "image4": ("IMAGE",),
+                "image5": ("IMAGE",),
                 "video": ("IMAGE",),
+                "video1": ("IMAGE",),
+                "video2": ("IMAGE",),
+                "video3": ("IMAGE",),
+                "audio": ("AUDIO",),
+                "audio1": ("AUDIO",),
+                "audio2": ("AUDIO",),
+                "audio3": ("AUDIO",),
             },
         }
 
@@ -714,9 +767,20 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
         model_name,
         device,
         preset_prompt,
+        system_prompt,
+        user_prompt,
         custom_prompt,
-        max_tokens,
         temperature,
+        is_memory,
+        is_tools_in_sys_prompt,
+        is_locked,
+        main_brain,
+        max_length,
+        max_tokens,
+        conversation_rounds,
+        historical_record,
+        is_enable,
+        stream,
         top_p,
         repetition_penalty,
         frame_count,
@@ -730,30 +794,98 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
         keep_model_loaded,
         seed,
         image=None,
+        image1=None,
+        image2=None,
+        image3=None,
+        image4=None,
+        image5=None,
         video=None,
+        video1=None,
+        video2=None,
+        video3=None,
+        audio=None,
+        audio1=None,
+        audio2=None,
+        audio3=None,
     ):
-        return self.run(
-            model_name=model_name,
-            preset_prompt=preset_prompt,
-            custom_prompt=custom_prompt,
-            image=image,
-            video=video,
-            frame_count=frame_count,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            seed=seed,
-            keep_model_loaded=keep_model_loaded,
-            device=device,
-            ctx=ctx,
-            n_batch=n_batch,
-            gpu_layers=gpu_layers,
-            image_max_tokens=image_max_tokens,
-            top_k=top_k,
-            pool_size=pool_size,
-            video_frame_size=video_frame_size,
+        if not is_enable:
+            return ("",)
+        if flag_enabled(is_locked) and self.last_response:
+            return (self.last_response,)
+
+        labeled_images = collect_labeled_images(
+            image=image, image1=image1, image2=image2, image3=image3, image4=image4, image5=image5
         )
+        labeled_videos = collect_labeled_videos(video=video, video1=video1, video2=video2, video3=video3)
+        audio_notes = collect_audio_notes(audio=audio, audio1=audio1, audio2=audio2, audio3=audio3)
+        user_text = resolve_user_prompt(preset_prompt, custom_prompt, user_prompt, SYSTEM_PROMPTS)
+        history = self.conversation_memory if flag_enabled(is_memory) else []
+        history_block = format_history_block(historical_record, history, conversation_rounds)
+        prompt_text = build_media_user_prompt(
+            (history_block + "\n\n" + user_text).strip() if history_block else user_text,
+            [lab for lab, _ in labeled_images],
+            [lab for lab, _ in labeled_videos],
+            audio_notes,
+        )
+        sys_text = compose_system_prompt(
+            system_prompt=system_prompt,
+            main_brain=main_brain,
+            is_tools_in_sys_prompt=is_tools_in_sys_prompt,
+        )
+        token_budget = int(max_length) if int(max_length or 0) > 0 else int(max_tokens)
+        torch.manual_seed(int(seed))
+        resolved = _resolve_model_entry(model_name)
+        effective_ctx = int(ctx) if ctx is not None else resolved.context_length
+
+        labeled_b64 = []
+        for label, tensor in labeled_images:
+            img = _tensor_to_base64_png(tensor, max_side=1280)
+            if img:
+                labeled_b64.append(("image", label, img))
+        for label, tensor in labeled_videos:
+            video_max_side = _resolve_safe_video_max_side(
+                tensor,
+                frame_count=int(frame_count),
+                ctx=effective_ctx,
+                video_frame_size=video_frame_size,
+            )
+            for i, frame in enumerate(_sample_video_frames(tensor, int(frame_count)), start=1):
+                img = _tensor_to_base64_png(frame, max_side=video_max_side)
+                if img:
+                    labeled_b64.append(("video", f"{label} frame {i}", img))
+
+        try:
+            self._load_model(
+                model_name=model_name,
+                device=device,
+                ctx=ctx,
+                n_batch=n_batch,
+                gpu_layers=gpu_layers,
+                image_max_tokens=image_max_tokens,
+                top_k=top_k,
+                pool_size=pool_size,
+            )
+            if labeled_b64 and self.chat_handler is None:
+                print("[QwenVL] Warning: media provided but this model has no mmproj; images/video frames will be ignored")
+            text = self._invoke(
+                system_prompt=sys_text,
+                user_prompt=prompt_text,
+                images_b64=[],
+                max_tokens=token_budget,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                seed=seed,
+                labeled_b64=labeled_b64 if self.chat_handler is not None else [],
+                stream=bool(stream),
+            )
+            self.last_response = text
+            if flag_enabled(is_memory):
+                self.conversation_memory.append({"user": user_text, "assistant": text})
+            return (text,)
+        finally:
+            if not keep_model_loaded:
+                self.clear()
 
 
 NODE_CLASS_MAPPINGS = {

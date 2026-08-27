@@ -437,3 +437,143 @@ def resolve_safe_video_max_side(
     return safe_side
 
 
+ENABLE_DISABLE = ["disable", "enable"]
+
+
+def flag_enabled(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"enable", "enabled", "true", "1", "yes"}
+
+
+def collect_labeled_images(image=None, image1=None, image2=None, image3=None, image4=None, image5=None, **_):
+    """Return connected still images as (label, tensor) in slot order."""
+    slots = [
+        ("Image 1", image1 if image1 is not None else image),
+        ("Image 2", image2),
+        ("Image 3", image3),
+        ("Image 4", image4),
+        ("Image 5", image5),
+    ]
+    return [(label, tensor) for label, tensor in slots if tensor is not None]
+
+
+def collect_labeled_videos(video=None, video1=None, video2=None, video3=None, **_):
+    """Return connected videos as (label, tensor) in slot order."""
+    slots = [
+        ("Video 1", video1 if video1 is not None else video),
+        ("Video 2", video2),
+        ("Video 3", video3),
+    ]
+    return [(label, tensor) for label, tensor in slots if tensor is not None]
+
+
+def describe_audio_slot(audio, index: int) -> str | None:
+    """Describe a connected ComfyUI AUDIO input. Local VL backends do not ingest raw waveforms."""
+    if audio is None:
+        return None
+    sr = None
+    duration = None
+    if isinstance(audio, dict):
+        sr = audio.get("sample_rate")
+        wav = audio.get("waveform")
+        try:
+            if wav is not None and hasattr(wav, "shape"):
+                n = int(wav.shape[-1])
+                if sr:
+                    duration = n / float(sr)
+        except Exception:
+            pass
+    extra = []
+    if sr:
+        extra.append(f"{sr} Hz")
+    if duration is not None:
+        extra.append(f"{duration:.2f}s")
+    detail = f" ({', '.join(extra)})" if extra else ""
+    return (
+        f"[Audio {index}] is connected{detail}. "
+        "This local VL backend cannot decode raw audio; treat it as a labeled slot only."
+    )
+
+
+def collect_audio_notes(audio=None, audio1=None, audio2=None, audio3=None, **_):
+    notes = []
+    for i, slot in enumerate([audio1 if audio1 is not None else audio, audio2, audio3], start=1):
+        note = describe_audio_slot(slot, i)
+        if note:
+            notes.append(note)
+    return notes
+
+
+def build_media_user_prompt(user_prompt: str, image_labels: list[str], video_labels: list[str], audio_notes: list[str]) -> str:
+    parts = []
+    if image_labels:
+        parts.append("Still images connected: " + ", ".join(image_labels) + ".")
+    if video_labels:
+        parts.append("Videos connected: " + ", ".join(video_labels) + ".")
+    if audio_notes:
+        parts.extend(audio_notes)
+    if image_labels or video_labels or audio_notes:
+        parts.append(
+            "When you refer to media, use these exact names (Image 1, Video 2, Audio 1, ...). "
+            "Ignore any slot that was not connected."
+        )
+    parts.append((user_prompt or "").strip())
+    return "\n".join(p for p in parts if p)
+
+
+def compose_system_prompt(
+    system_prompt: str = "",
+    main_brain: str | bool = "enable",
+    is_tools_in_sys_prompt: str | bool = "disable",
+) -> str:
+    chunks = []
+    custom_sys = (system_prompt or "").strip()
+    if custom_sys:
+        chunks.append(custom_sys)
+    else:
+        chunks.append(
+            "You are a helpful vision-language assistant. "
+            "Answer directly with the final answer only. No <think> and no reasoning."
+        )
+    if flag_enabled(main_brain):
+        chunks.append(
+            "You are the main brain for this workflow: coordinate all connected images, videos, "
+            "and user instructions into one coherent final answer."
+        )
+    if flag_enabled(is_tools_in_sys_prompt):
+        chunks.append(
+            "If tool or function instructions appear in this system prompt or the user prompt, follow them."
+        )
+    return "\n".join(chunks)
+
+
+def resolve_user_prompt(preset_prompt: str, custom_prompt: str, user_prompt: str, system_prompts: dict) -> str:
+    if user_prompt and str(user_prompt).strip():
+        return str(user_prompt).strip()
+    if custom_prompt and str(custom_prompt).strip():
+        return str(custom_prompt).strip()
+    return system_prompts.get(preset_prompt, preset_prompt)
+
+
+def format_history_block(historical_record: str, memory_turns: list, conversation_rounds: int) -> str:
+    parts = []
+    rec = (historical_record or "").strip()
+    if rec:
+        parts.append("Historical record:\n" + rec)
+    rounds = max(int(conversation_rounds or 1), 1)
+    if memory_turns:
+        recent = memory_turns[-rounds:]
+        lines = []
+        for turn in recent:
+            u = (turn.get("user") or "").strip()
+            a = (turn.get("assistant") or "").strip()
+            if u:
+                lines.append(f"User: {u}")
+            if a:
+                lines.append(f"Assistant: {a}")
+        if lines:
+            parts.append("Conversation memory:\n" + "\n".join(lines))
+    return "\n\n".join(parts)
+
+
