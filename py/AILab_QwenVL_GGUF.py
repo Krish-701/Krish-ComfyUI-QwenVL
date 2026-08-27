@@ -46,6 +46,7 @@ from AILab_Utils import (
     tensor_to_base64_png,
     sample_video_frames,
     resolve_safe_video_max_side,
+    download_public_hf_file,
     collect_labeled_images,
     collect_labeled_videos,
     collect_audio_notes,
@@ -174,22 +175,31 @@ def _download_single_file(repo_ids: list[str], filename: str, target_path: Path)
     for repo_id in repo_ids:
         print(f"[QwenVL] Downloading {filename} from {repo_id} -> {target_path}")
         try:
-            downloaded = hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                repo_type="model",
-                local_dir=str(target_path.parent),
-                local_dir_use_symlinks=False,
-            )
-            downloaded_path = Path(downloaded)
-            if downloaded_path.exists() and downloaded_path.resolve() != target_path.resolve():
-                downloaded_path.replace(target_path)
+            download_public_hf_file(repo_id, filename, target_path)
             if target_path.exists():
                 print(f"[QwenVL] Download complete: {target_path}")
             break
         except Exception as exc:
             last_exc = exc
-            print(f"[QwenVL] hf_hub_download failed from {repo_id}: {exc}")
+            print(f"[QwenVL] Public HTTPS download failed from {repo_id}: {exc}")
+            try:
+                downloaded = hf_hub_download(
+                    repo_id=repo_id,
+                    filename=filename,
+                    repo_type="model",
+                    local_dir=str(target_path.parent),
+                    token=False,
+                )
+                downloaded_path = Path(downloaded)
+                if downloaded_path.exists() and downloaded_path.resolve() != target_path.resolve():
+                    downloaded_path.replace(target_path)
+                if target_path.exists():
+                    print(f"[QwenVL] Download complete: {target_path}")
+                    last_exc = None
+                    break
+            except Exception as hub_exc:
+                last_exc = hub_exc
+                print(f"[QwenVL] hf_hub_download failed from {repo_id}: {hub_exc}")
     else:
         raise FileNotFoundError(f"[QwenVL] Download failed for {filename}: {last_exc}")
 
@@ -569,8 +579,19 @@ class QwenVLGGUFBase:
 
             message = (result.get("choices") or [{}])[0].get("message", {}) or {}
             raw = message.get("content", "")
-            extra_reasoning = message.get("reasoning_content") or ""
+            if isinstance(raw, list):
+                raw = "".join(
+                    (part.get("text") if isinstance(part, dict) else str(part))
+                    for part in raw
+                )
+            extra_reasoning = (
+                message.get("reasoning_content")
+                or message.get("reasoning")
+                or ""
+            )
         cleaned, reasoning = split_response_and_reasoning(str(raw or ""), extra_reasoning, mode="text")
+        if reasoning and cleaned and reasoning in cleaned:
+            cleaned = cleaned.replace(reasoning, "", 1).strip()
         return cleaned, reasoning
 
     def run(

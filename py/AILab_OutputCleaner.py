@@ -17,9 +17,19 @@ class OutputCleanConfig:
 
 _ROLE_PREFIX_RE = re.compile(r"^\s*(assistant|final|output|response|result|prompt)\s*:\s*", re.IGNORECASE)
 _CODE_FENCE_RE = re.compile(r"^\s*```[\w-]*\s*$", re.IGNORECASE)
-_THINK_BLOCK_RE = re.compile(r"<think[^>]*>.*?</think>", flags=re.IGNORECASE | re.DOTALL)
-_THINK_OPEN_RE = re.compile(r"<think[^>]*>", flags=re.IGNORECASE)
-_THINK_CLOSE_RE = re.compile(r"</think\s*>", flags=re.IGNORECASE)
+_THINK_BLOCK_RE = re.compile(
+    r"<(?:think|thinking)[^>]*>.*?</(?:think|thinking)\s*>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_THINK_OPEN_RE = re.compile(r"<(?:think|thinking)[^>]*>", flags=re.IGNORECASE)
+_THINK_CLOSE_RE = re.compile(r"</(?:think|thinking)\s*>", flags=re.IGNORECASE)
+_ALT_THINK_BLOCK_RE = re.compile(
+    r"(?:<\|think\|>|◁think▷)(.*?)(?:<\|/think\|>|◁/think▷)",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_FINAL_MARKER_RE = re.compile(
+    r"(?im)^\s*(?:final\s+answer|final|answer|output|response)\s*[:\-]\s*",
+)
 _MARKER_RE = re.compile(
     r"(?im)^\s*(final|final answer|answer|output|result|prompt)\s*[:\-]\s*",
 )
@@ -38,39 +48,121 @@ _PLANNING_RE = re.compile(
 )
 
 
+def _dedupe_parts(parts: list[str]) -> str:
+    seen = set()
+    unique = []
+    for p in parts:
+        t = (p or "").strip()
+        if t and t not in seen:
+            seen.add(t)
+            unique.append(t)
+    return "\n\n".join(unique).strip()
+
+
 def extract_reasoning_content(text: str, extra: str | None = None) -> str:
-    """Pull model reasoning from <think> blocks and optional API reasoning_content."""
+    """Pull model reasoning from think tags and optional API reasoning_content."""
     parts: list[str] = []
     extra_text = (extra or "").strip()
     if extra_text:
         parts.append(extra_text)
     raw = text or ""
-    for match in re.finditer(r"<think[^>]*>(.*?)</think>", raw, flags=re.IGNORECASE | re.DOTALL):
+    for match in re.finditer(
+        r"<(?:think|thinking)[^>]*>(.*?)</(?:think|thinking)\s*>",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
         inner = (match.group(1) or "").strip()
         if inner:
             parts.append(inner)
-    if not parts:
+    for match in _ALT_THINK_BLOCK_RE.finditer(raw):
+        inner = (match.group(1) or "").strip()
+        if inner:
+            parts.append(inner)
+    if not any(p != extra_text for p in parts):
         open_m = _THINK_OPEN_RE.search(raw)
         if open_m:
             after = raw[open_m.end() :]
             close_m = _THINK_CLOSE_RE.search(after)
             body = after[: close_m.start()] if close_m else after
+            marker = _FINAL_MARKER_RE.search(body)
+            if marker and not close_m:
+                body = body[: marker.start()]
             body = body.strip()
             if body:
                 parts.append(body)
-    seen = set()
-    unique = []
-    for p in parts:
-        if p not in seen:
-            seen.add(p)
-            unique.append(p)
-    return "\n\n".join(unique).strip()
+    return _dedupe_parts(parts)
+
+
+def _strip_think_markup(text: str) -> str:
+    cleaned = _THINK_BLOCK_RE.sub("", text or "")
+    cleaned = _ALT_THINK_BLOCK_RE.sub("", cleaned)
+    cleaned = _THINK_CLOSE_RE.sub("", cleaned)
+    open_m = _THINK_OPEN_RE.search(cleaned)
+    if open_m:
+        after = cleaned[open_m.end() :]
+        marker = _FINAL_MARKER_RE.search(after)
+        cleaned = after[marker.end() :] if marker else ""
+    return cleaned.strip()
+
+
+def _strip_reasoning_overlap(response: str, reasoning: str) -> str:
+    resp = (response or "").strip()
+    reason = (reasoning or "").strip()
+    if not resp:
+        return ""
+    if reason and resp.startswith(reason):
+        resp = resp[len(reason) :].strip()
+    if reason and reason in resp:
+        # Drop a leading copy of the think block if the model echoed it.
+        idx = resp.find(reason)
+        if idx == 0:
+            resp = resp[len(reason) :].strip()
+    return resp.strip()
 
 
 def split_response_and_reasoning(text: str, extra_reasoning: str | None = None, mode: str = "text") -> tuple[str, str]:
-    reasoning = extract_reasoning_content(text, extra_reasoning)
-    cleaned = clean_model_output(text, OutputCleanConfig(mode=mode, strip_think=True))
-    return cleaned.strip(), reasoning
+    raw = text or ""
+    extra = (extra_reasoning or "").strip()
+    reasoning = extract_reasoning_content(raw, extra)
+
+    answer = raw
+    close_matches = list(_THINK_CLOSE_RE.finditer(raw))
+    if close_matches:
+        answer = raw[close_matches[-1].end() :]
+    else:
+        alt_matches = list(_ALT_THINK_BLOCK_RE.finditer(raw))
+        if alt_matches:
+            answer = raw[alt_matches[-1].end() :]
+        else:
+            answer = _strip_think_markup(raw)
+            if extra and extra in answer:
+                answer = answer.replace(extra, "", 1)
+
+    answer = _strip_think_markup(answer)
+    answer = _IM_TOKEN_RE.sub("", answer).strip()
+    answer = _strip_reasoning_overlap(answer, reasoning)
+
+    if extra and not reasoning:
+        reasoning = extra
+        answer = _strip_reasoning_overlap(answer, extra)
+
+    if answer and reasoning and answer == reasoning:
+        answer = ""
+
+    # Light cleanup on the answer only — never keep think text in RESPONSE.
+    if answer:
+        answer = clean_model_output(
+            answer,
+            OutputCleanConfig(
+                mode=mode,
+                strip_think=True,
+                strip_planning=False,
+                strip_leading_preamble=False,
+            ),
+        )
+        answer = _strip_reasoning_overlap(answer, reasoning)
+
+    return answer.strip(), reasoning.strip()
 
 
 def clean_model_output(text: str, config: OutputCleanConfig | None = None) -> str:

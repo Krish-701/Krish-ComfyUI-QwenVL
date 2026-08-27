@@ -3,8 +3,16 @@ import inspect
 import io
 import json
 import math
+import os
 import re
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
+
+# Public Hub downloads: skip Xet (often hangs without a token) and hf_transfer.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+os.environ.setdefault("HF_HUB_DISABLE_HF_TRANSFER", "1")
 
 import numpy as np
 import torch
@@ -30,6 +38,87 @@ GGUF_CONFIG_PATH = PLUGIN_DIR / "gguf_models.json"
 HF_CONFIG_PATH = PLUGIN_DIR / "hf_models.json"
 
 OUTPUT_LANGUAGES = ["English", "Chinese (中文)"]
+
+
+def download_public_hf_file(repo_id: str, filename: str, target_path: Path, revision: str = "main") -> Path:
+    """Download a public Hub file over HTTPS with resume + progress. No HF token required."""
+    target_path = Path(target_path)
+    if target_path.exists() and target_path.stat().st_size > 0:
+        print(f"[QwenVL] Using cached file: {target_path}")
+        return target_path
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    url = f"https://huggingface.co/{repo_id}/resolve/{revision}/{filename}?download=true"
+    part_path = target_path.with_suffix(target_path.suffix + ".part")
+    existing = part_path.stat().st_size if part_path.exists() else 0
+
+    headers = {
+        "User-Agent": "Krish-ComfyUI-QwenVL/2.3 (public-download)",
+        "Accept": "*/*",
+    }
+    if existing > 0:
+        headers["Range"] = f"bytes={existing}-"
+        print(f"[QwenVL] Resuming download at {existing / (1024 ** 3):.2f} GB -> {target_path.name}")
+    else:
+        print(f"[QwenVL] Downloading (no token) {repo_id}/{filename}")
+        print(f"[QwenVL] URL: {url}")
+
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        response = urllib.request.urlopen(req, timeout=300)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 416 and existing > 0:
+            part_path.replace(target_path)
+            print(f"[QwenVL] Download complete (already finished): {target_path}")
+            return target_path
+        raise
+
+    total_from_length = response.headers.get("Content-Length")
+    content_range = response.headers.get("Content-Range")
+    total = None
+    if content_range and "/" in content_range:
+        try:
+            total = int(content_range.rsplit("/", 1)[-1])
+        except ValueError:
+            total = None
+    if total is None and total_from_length:
+        try:
+            total = int(total_from_length) + existing
+        except ValueError:
+            total = None
+
+    mode = "ab" if existing > 0 and response.status == 206 else "wb"
+    if mode == "wb":
+        existing = 0
+    downloaded = existing
+    last_log = time.time()
+    chunk = 8 * 1024 * 1024
+
+    with open(part_path, mode) as fh, response:
+        while True:
+            data = response.read(chunk)
+            if not data:
+                break
+            fh.write(data)
+            downloaded += len(data)
+            now = time.time()
+            if now - last_log >= 3:
+                if total:
+                    pct = 100.0 * downloaded / total
+                    print(
+                        f"[QwenVL] {target_path.name}: {downloaded / (1024 ** 3):.2f}/"
+                        f"{total / (1024 ** 3):.2f} GB ({pct:.1f}%)"
+                    )
+                else:
+                    print(f"[QwenVL] {target_path.name}: {downloaded / (1024 ** 3):.2f} GB downloaded")
+                last_log = now
+
+    if total and downloaded < total:
+        raise IOError(f"[QwenVL] Incomplete download {downloaded} / {total} bytes for {filename}")
+
+    part_path.replace(target_path)
+    print(f"[QwenVL] Download complete: {target_path} ({downloaded / (1024 ** 3):.2f} GB)")
+    return target_path
 
 
 def safe_dirname(value: str) -> str:
@@ -559,8 +648,8 @@ def compose_system_prompt(
     else:
         chunks.append(
             "You are a helpful vision-language assistant. "
-            "Put step-by-step reasoning inside <think>...</think>. "
-            "After the think block, output only the final answer."
+            "Put ALL step-by-step reasoning inside <think>...</think> only. "
+            "After </think>, output ONLY the final answer with no reasoning, no recap, and no think tags."
         )
     if flag_enabled(main_brain):
         chunks.append(

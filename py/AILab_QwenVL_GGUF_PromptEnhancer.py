@@ -32,6 +32,7 @@ from AILab_Utils import (
     model_name_to_filename_candidates,
     load_system_prompts,
     parse_gguf_repos,
+    download_public_hf_file,
 )
 
 _prompt_data = load_system_prompts()
@@ -195,12 +196,18 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
             attempted.append(repo_id)
             print(f"[QwenVL] Downloading GGUF {filename} from {repo_id}")
             try:
+                download_public_hf_file(repo_id, filename, resolved)
+            except Exception as exc:
+                print(f"[QwenVL] Public HTTPS download failed from {repo_id}: {exc}")
+            if resolved.exists():
+                break
+            try:
                 downloaded = hf_hub_download(
                     repo_id=repo_id,
                     filename=filename,
                     repo_type="model",
                     local_dir=str(target_dir),
-                    local_dir_use_symlinks=False,
+                    token=False,
                 )
                 downloaded_path = Path(downloaded)
                 if downloaded_path.exists() and downloaded_path.resolve() != resolved.resolve():
@@ -215,8 +222,8 @@ class AILab_QwenVL_GGUF_PromptEnhancer:
                     repo_id=repo_id,
                     repo_type="model",
                     local_dir=str(target_dir),
-                    local_dir_use_symlinks=False,
                     allow_patterns=[filename, f"**/{filename}"],
+                    token=False,
                 )
             except Exception as exc:
                 print(f"[QwenVL] Filtered snapshot failed from {repo_id}: {exc}")
