@@ -813,12 +813,11 @@ class QwenVLBase:
         user_content = []
         images = labeled_images if labeled_images is not None else ([("Image 1", image)] if image is not None else [])
         videos = labeled_videos if labeled_videos is not None else ([("Video 1", video)] if video is not None else [])
-        for label, tensor in images:
+        for _label, tensor in images:
             pil = tensor_to_pil(tensor, max_side=1280)
             if pil is not None:
-                user_content.append({"type": "text", "text": f"[{label}]"})
                 user_content.append({"type": "image", "image": pil})
-        for label, tensor in videos:
+        for _label, tensor in videos:
             video_max_side = resolve_safe_video_max_side(
                 tensor,
                 frame_count=int(frame_count),
@@ -829,7 +828,6 @@ class QwenVLBase:
             pil_frames = [tensor_to_pil(frame, max_side=video_max_side) for frame in frames]
             pil_frames = [f for f in pil_frames if f is not None]
             if pil_frames:
-                user_content.append({"type": "text", "text": f"[{label}] ({len(pil_frames)} frames)"})
                 user_content.append({"type": "video", "video": pil_frames})
         user_content.append({"type": "text", "text": prompt_text})
         conversation = []

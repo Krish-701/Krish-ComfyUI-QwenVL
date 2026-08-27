@@ -620,20 +620,9 @@ def collect_audio_notes(audio=None, audio1=None, audio2=None, audio3=None, **_):
 
 
 def build_media_user_prompt(user_prompt: str, image_labels: list[str], video_labels: list[str], audio_notes: list[str]) -> str:
-    parts = []
-    if image_labels:
-        parts.append("Still images connected: " + ", ".join(image_labels) + ".")
-    if video_labels:
-        parts.append("Videos connected: " + ", ".join(video_labels) + ".")
-    if audio_notes:
-        parts.extend(audio_notes)
-    if image_labels or video_labels or audio_notes:
-        parts.append(
-            "When you refer to media, use these exact names (Image 1, Video 2, Audio 1, ...). "
-            "Ignore any slot that was not connected."
-        )
-    parts.append((user_prompt or "").strip())
-    return "\n".join(p for p in parts if p)
+    """Return the user prompt only. Connected media is sent as tensors, not named Image 1 / Video 1 slots."""
+    _ = image_labels, video_labels, audio_notes
+    return (user_prompt or "").strip()
 
 
 def compose_system_prompt(

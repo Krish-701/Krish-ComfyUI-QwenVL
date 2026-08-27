@@ -518,10 +518,9 @@ class QwenVLGGUFBase:
 
         if labeled and self.chat_handler is not None:
             content = []
-            for _kind, label, img in labeled:
+            for _kind, _label, img in labeled:
                 if not img:
                     continue
-                content.append({"type": "text", "text": f"[{label}]"})
                 content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}"}})
             content.append({"type": "text", "text": user_prompt})
             messages = [
