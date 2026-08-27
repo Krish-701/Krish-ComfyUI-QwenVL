@@ -153,6 +153,31 @@ def estimate_vram_requirement(repo_name: str) -> dict:
     return {"full": 8.0, "8bit": 4.5, "4bit": 3.0}
 
 
+NONE_PRESET = "none"
+TOKEN_PRESETS = ["16k", "32k", "64k"]
+TOKEN_PRESET_VALUES = {"16k": 16384, "32k": 32768, "64k": 65536}
+
+
+def with_none_preset(presets: list | None) -> list[str]:
+    cleaned = [p for p in (presets or []) if str(p).strip().lower() != NONE_PRESET]
+    return [NONE_PRESET] + cleaned
+
+
+def parse_token_preset(value) -> int:
+    key = str(value or "16k").strip().lower()
+    if key.startswith("16"):
+        return 16384
+    if key.startswith("32"):
+        return 32768
+    if key.startswith("64"):
+        return 65536
+    try:
+        parsed = int(key.replace("k", "").strip())
+        return parsed if parsed > 256 else 16384
+    except Exception:
+        return 16384
+
+
 def load_system_prompts():
     """Load system prompts and presets from system_prompts.json."""
     preset_prompts = ["🖼️ Detailed Description"]
@@ -173,7 +198,7 @@ def load_system_prompts():
             print(f"[QwenVL] System prompts load failed: {exc}")
 
     return {
-        "preset_prompts": preset_prompts,
+        "preset_prompts": with_none_preset(preset_prompts),
         "qwenvl_prompts": qwenvl_prompts,
         "qwen_text_styles": qwen_text_styles,
         "translation_prompt": translation_prompt,
@@ -534,7 +559,8 @@ def compose_system_prompt(
     else:
         chunks.append(
             "You are a helpful vision-language assistant. "
-            "Answer directly with the final answer only. No <think> and no reasoning."
+            "Put step-by-step reasoning inside <think>...</think>. "
+            "After the think block, output only the final answer."
         )
     if flag_enabled(main_brain):
         chunks.append(
@@ -553,6 +579,8 @@ def resolve_user_prompt(preset_prompt: str, custom_prompt: str, user_prompt: str
         return str(user_prompt).strip()
     if custom_prompt and str(custom_prompt).strip():
         return str(custom_prompt).strip()
+    if str(preset_prompt or "").strip().lower() == NONE_PRESET:
+        return ""
     return system_prompts.get(preset_prompt, preset_prompt)
 
 

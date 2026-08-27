@@ -26,13 +26,15 @@ from huggingface_hub import hf_hub_download
 from PIL import Image
 
 import folder_paths
-from AILab_OutputCleaner import OutputCleanConfig, clean_model_output
+from AILab_OutputCleaner import OutputCleanConfig, clean_model_output, split_response_and_reasoning
 
 from AILab_Utils import (
     PLUGIN_DIR,
     GGUF_CONFIG_PATH,
     CUSTOM_MODELS_PATH,
     ENABLE_DISABLE,
+    TOKEN_PRESETS,
+    parse_token_preset,
     safe_dirname,
     resolve_base_dir,
     find_local_gguf_file,
@@ -249,6 +251,7 @@ class QwenVLGGUFBase:
         self.current_signature = None
         self.conversation_memory = []
         self.last_response = ""
+        self.last_reasoning = ""
 
     def clear(self):
         self.llm = None
@@ -420,7 +423,7 @@ class QwenVLGGUFBase:
             mmproj_kwargs = {
                 "clip_model_path": str(mmproj_path),
                 "image_max_tokens": img_max,
-                "force_reasoning": False,
+                "force_reasoning": True,
                 "verbose": False,
             }
             mmproj_kwargs = filter_kwargs_for_callable(getattr(handler_cls, "__init__", handler_cls), mmproj_kwargs)
@@ -505,15 +508,20 @@ class QwenVLGGUFBase:
             seed=int(seed),
             stop=["<|im_end|>", "<|im_start|>"],
         )
+        extra_reasoning = ""
         if stream:
             pieces = []
+            reasoning_pieces = []
             for part in self.llm.create_chat_completion(**completion_kwargs, stream=True):
-                delta = ((part.get("choices") or [{}])[0].get("delta") or {}).get("content") or ""
-                if delta:
-                    pieces.append(delta)
+                delta = (part.get("choices") or [{}])[0].get("delta") or {}
+                if delta.get("content"):
+                    pieces.append(delta["content"])
+                if delta.get("reasoning_content"):
+                    reasoning_pieces.append(delta["reasoning_content"])
             elapsed = max(time.perf_counter() - start, 1e-6)
             print(f"[QwenVL] Stream complete in {elapsed:.2f}s")
             raw = "".join(pieces)
+            extra_reasoning = "".join(reasoning_pieces)
         else:
             result = self.llm.create_chat_completion(**completion_kwargs)
             elapsed = max(time.perf_counter() - start, 1e-6)
@@ -531,9 +539,11 @@ class QwenVLGGUFBase:
                 else:
                     print(f"[QwenVL] Tokens: completion={completion_tokens}, time={elapsed:.2f}s, speed={tok_s:.2f} tok/s")
 
-            raw = (result.get("choices") or [{}])[0].get("message", {}).get("content", "")
-        cleaned = clean_model_output(str(raw or ""), OutputCleanConfig(mode="text"))
-        return cleaned.strip()
+            message = (result.get("choices") or [{}])[0].get("message", {}) or {}
+            raw = message.get("content", "")
+            extra_reasoning = message.get("reasoning_content") or ""
+        cleaned, reasoning = split_response_and_reasoning(str(raw or ""), extra_reasoning, mode="text")
+        return cleaned, reasoning
 
     def run(
         self,
@@ -560,9 +570,7 @@ class QwenVLGGUFBase:
     ):
         torch.manual_seed(int(seed))
 
-        prompt = SYSTEM_PROMPTS.get(preset_prompt, preset_prompt)
-        if custom_prompt and custom_prompt.strip():
-            prompt = custom_prompt.strip()
+        prompt = resolve_user_prompt(preset_prompt, custom_prompt, "", SYSTEM_PROMPTS)
 
         resolved = _resolve_model_entry(model_name)
         effective_ctx = int(ctx) if ctx is not None else resolved.context_length
@@ -597,11 +605,8 @@ class QwenVLGGUFBase:
             )
             if images_b64 and self.chat_handler is None:
                 print("[QwenVL] Warning: images provided but this model entry has no mmproj_file; images will be ignored")
-            text = self._invoke(
-                system_prompt=(
-                    "You are a helpful vision-language assistant. "
-                    "Answer directly with the final answer only. No <think> and no reasoning."
-                ),
+            text, reasoning = self._invoke(
+                system_prompt=compose_system_prompt(),
                 user_prompt=prompt,
                 images_b64=images_b64 if self.chat_handler is not None else [],
                 max_tokens=max_tokens,
@@ -610,7 +615,7 @@ class QwenVLGGUFBase:
                 repetition_penalty=repetition_penalty,
                 seed=seed,
             )
-            return (text,)
+            return (text, reasoning)
         finally:
             if not keep_model_loaded:
                 self.clear()
@@ -628,16 +633,15 @@ class AILab_QwenVL_GGUF(QwenVLGGUFBase):
         model_keys = sorted(list(all_models.keys())) or ["(edit gguf_models.json)"]
         default_model = model_keys[0]
 
-        prompts = PRESET_PROMPTS or ["🖼️ Detailed Description"]
-        preferred_prompt = "🖼️ Detailed Description"
-        default_prompt = preferred_prompt if preferred_prompt in prompts else prompts[0]
+        prompts = PRESET_PROMPTS or ["none"]
+        default_prompt = "none" if "none" in prompts else prompts[0]
 
         return {
             "required": {
                 "model_name": (model_keys, {"default": default_model}),
                 "preset_prompt": (prompts, {"default": default_prompt}),
                 "custom_prompt": ("STRING", {"default": "", "multiline": True}),
-                "max_tokens": ("INT", {"default": 512, "min": 64, "max": 2048}),
+                "max_tokens": ("INT", {"default": 16384, "min": 64, "max": 65536}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1}),
             },
@@ -647,8 +651,8 @@ class AILab_QwenVL_GGUF(QwenVLGGUFBase):
             },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("RESPONSE",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("RESPONSE", "reasoning_content")
     FUNCTION = "process"
     CATEGORY = "🧪AILab/QwenVL"
 
@@ -699,9 +703,8 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
         model_keys = sorted(list(all_models.keys())) or ["(edit gguf_models.json)"]
         default_model = model_keys[0]
 
-        prompts = PRESET_PROMPTS or ["🖼️ Detailed Description"]
-        preferred_prompt = "🖼️ Detailed Description"
-        default_prompt = preferred_prompt if preferred_prompt in prompts else prompts[0]
+        prompts = PRESET_PROMPTS or ["none"]
+        default_prompt = "none" if "none" in prompts else prompts[0]
 
         num_gpus = torch.cuda.device_count()
         gpu_list = [f"cuda:{i}" for i in range(num_gpus)]
@@ -715,13 +718,14 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
                 "system_prompt": ("STRING", {"default": "", "multiline": True}),
                 "user_prompt": ("STRING", {"default": "", "multiline": True}),
                 "custom_prompt": ("STRING", {"default": "", "multiline": True}),
+                "token_preset": (TOKEN_PRESETS, {"default": "16k"}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0}),
                 "is_memory": (ENABLE_DISABLE, {"default": "disable"}),
                 "is_tools_in_sys_prompt": (ENABLE_DISABLE, {"default": "disable"}),
                 "is_locked": (ENABLE_DISABLE, {"default": "disable"}),
                 "main_brain": (ENABLE_DISABLE, {"default": "enable"}),
-                "max_length": ("INT", {"default": 1920, "min": 64, "max": 8192}),
-                "max_tokens": ("INT", {"default": 512, "min": 64, "max": 4096}),
+                "max_length": ("INT", {"default": 16384, "min": 64, "max": 65536}),
+                "max_tokens": ("INT", {"default": 16384, "min": 64, "max": 65536}),
                 "conversation_rounds": ("INT", {"default": 1, "min": 1, "max": 32}),
                 "historical_record": ("STRING", {"default": "", "multiline": True}),
                 "is_enable": ("BOOLEAN", {"default": True}),
@@ -730,10 +734,10 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
                 "repetition_penalty": ("FLOAT", {"default": 1.2, "min": 0.5, "max": 2.0}),
                 "frame_count": ("INT", {"default": 16, "min": 1, "max": 64}),
                 "video_frame_size": (["auto", "384", "448", "512", "768", "original"], {"default": "auto"}),
-                "ctx": ("INT", {"default": 8192, "min": 1024, "max": 262144, "step": 512}),
+                "ctx": ("INT", {"default": 65536, "min": 1024, "max": 262144, "step": 512}),
                 "n_batch": ("INT", {"default": 512, "min": 64, "max": 32768, "step": 64}),
                 "gpu_layers": ("INT", {"default": -1, "min": -1, "max": 200}),
-                "image_max_tokens": ("INT", {"default": 4096, "min": 256, "max": 1024000, "step": 256}),
+                "image_max_tokens": ("INT", {"default": 16384, "min": 256, "max": 65536, "step": 256}),
                 "top_k": ("INT", {"default": 0, "min": 0, "max": 32768}),
                 "pool_size": ("INT", {"default": 4194304, "min": 1048576, "max": 10485760, "step": 524288}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
@@ -757,8 +761,8 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
             },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("RESPONSE",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("RESPONSE", "reasoning_content")
     FUNCTION = "process"
     CATEGORY = "🧪AILab/QwenVL"
 
@@ -770,6 +774,7 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
         system_prompt,
         user_prompt,
         custom_prompt,
+        token_preset,
         temperature,
         is_memory,
         is_tools_in_sys_prompt,
@@ -809,9 +814,9 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
         audio3=None,
     ):
         if not is_enable:
-            return ("",)
+            return ("", "")
         if flag_enabled(is_locked) and self.last_response:
-            return (self.last_response,)
+            return (self.last_response, self.last_reasoning)
 
         labeled_images = collect_labeled_images(
             image=image, image1=image1, image2=image2, image3=image3, image4=image4, image5=image5
@@ -832,10 +837,10 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
             main_brain=main_brain,
             is_tools_in_sys_prompt=is_tools_in_sys_prompt,
         )
-        token_budget = int(max_length) if int(max_length or 0) > 0 else int(max_tokens)
+        token_budget = max(parse_token_preset(token_preset), int(max_length or 0), int(max_tokens or 0))
         torch.manual_seed(int(seed))
         resolved = _resolve_model_entry(model_name)
-        effective_ctx = int(ctx) if ctx is not None else resolved.context_length
+        effective_ctx = max(int(ctx) if ctx is not None else resolved.context_length, token_budget)
 
         labeled_b64 = []
         for label, tensor in labeled_images:
@@ -858,16 +863,16 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
             self._load_model(
                 model_name=model_name,
                 device=device,
-                ctx=ctx,
+                ctx=effective_ctx,
                 n_batch=n_batch,
                 gpu_layers=gpu_layers,
-                image_max_tokens=image_max_tokens,
+                image_max_tokens=max(int(image_max_tokens or 0), min(token_budget, 65536)),
                 top_k=top_k,
                 pool_size=pool_size,
             )
             if labeled_b64 and self.chat_handler is None:
                 print("[QwenVL] Warning: media provided but this model has no mmproj; images/video frames will be ignored")
-            text = self._invoke(
+            text, reasoning = self._invoke(
                 system_prompt=sys_text,
                 user_prompt=prompt_text,
                 images_b64=[],
@@ -880,9 +885,10 @@ class AILab_QwenVL_GGUF_Advanced(QwenVLGGUFBase):
                 stream=bool(stream),
             )
             self.last_response = text
+            self.last_reasoning = reasoning
             if flag_enabled(is_memory):
                 self.conversation_memory.append({"user": user_text, "assistant": text})
-            return (text,)
+            return (text, reasoning)
         finally:
             if not keep_model_loaded:
                 self.clear()

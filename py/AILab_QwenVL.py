@@ -33,6 +33,7 @@ from transformers import AutoProcessor, AutoTokenizer, BitsAndBytesConfig
 
 import folder_paths
 from comfy.utils import ProgressBar
+from AILab_OutputCleaner import split_response_and_reasoning
 
 # SageAttention support
 try:
@@ -51,7 +52,9 @@ from AILab_Utils import (
     HF_CONFIG_PATH,
     SYSTEM_PROMPTS_PATH,
     ENABLE_DISABLE,
+    TOKEN_PRESETS,
     load_system_prompts,
+    parse_token_preset,
     tensor_to_pil,
     sample_video_frames,
     resolve_safe_video_max_side,
@@ -562,6 +565,7 @@ class QwenVLBase:
         self.current_signature = None
         self.conversation_memory = []
         self.last_response = ""
+        self.last_reasoning = ""
         print(f"[QwenVL] Node on {self.device_info['device_type']}")
 
     def clear(self):
@@ -862,16 +866,15 @@ class QwenVLBase:
             torch.cuda.synchronize()
         input_len = model_inputs["input_ids"].shape[-1]
         text = self.tokenizer.decode(outputs[0, input_len:], skip_special_tokens=True)
-        return text.strip()
+        response, reasoning = split_response_and_reasoning(text)
+        return response, reasoning
 
     def run(self, model_name, quantization, preset_prompt, custom_prompt, image, video, frame_count, max_tokens, temperature, top_p, num_beams, repetition_penalty, seed, keep_model_loaded, attention_mode, use_torch_compile, device, video_frame_size="auto"):
         # Create progress bar with 3 stages: setup, model loading, generation
         pbar = ProgressBar(3)
         
         torch.manual_seed(seed)
-        prompt = SYSTEM_PROMPTS.get(preset_prompt, preset_prompt)
-        if custom_prompt and custom_prompt.strip():
-            prompt = custom_prompt.strip()
+        prompt = resolve_user_prompt(preset_prompt, custom_prompt, "", SYSTEM_PROMPTS)
         
         pbar.update_absolute(1, 3, None)
         
@@ -887,7 +890,7 @@ class QwenVLBase:
         pbar.update_absolute(2, 3, None)
         
         try:
-            text = self.generate(
+            text, reasoning = self.generate(
                 prompt,
                 image,
                 video,
@@ -903,7 +906,7 @@ class QwenVLBase:
             
             pbar.update_absolute(3, 3, None)
             
-            return (text,)
+            return (text, reasoning)
         finally:
             if not keep_model_loaded:
                 self.clear()
@@ -918,9 +921,8 @@ class AILab_QwenVL(QwenVLBase):
         load_model_configs()
         models = list(HF_VL_MODELS.keys())
         default_model = models[0] if models else "Qwen3-VL-4B-Instruct"
-        prompts = PRESET_PROMPTS or ["Describe this image in detail."]
-        preferred_prompt = "🖼️ Detailed Description"
-        default_prompt = preferred_prompt if preferred_prompt in prompts else prompts[0]
+        prompts = PRESET_PROMPTS or ["none"]
+        default_prompt = "none" if "none" in prompts else prompts[0]
         return {
             "required": {
                 "model_name": (models, {"default": default_model, "tooltip": TOOLTIPS["model_name"]}),
@@ -928,7 +930,7 @@ class AILab_QwenVL(QwenVLBase):
                 "attention_mode": (ATTENTION_MODES, {"default": "auto", "tooltip": TOOLTIPS["attention_mode"]}),
                 "preset_prompt": (prompts, {"default": default_prompt, "tooltip": TOOLTIPS["preset_prompt"]}),
                 "custom_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": TOOLTIPS["custom_prompt"]}),
-                "max_tokens": ("INT", {"default": 512, "min": 64, "max": 2048, "tooltip": TOOLTIPS["max_tokens"]}),
+                "max_tokens": ("INT", {"default": 16384, "min": 64, "max": 65536, "tooltip": TOOLTIPS["max_tokens"]}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["keep_model_loaded"]}),
                 "seed": ("INT", {"default": 1, "min": 1, "max": 2**32 - 1, "tooltip": TOOLTIPS["seed"]}),
             },
@@ -938,8 +940,8 @@ class AILab_QwenVL(QwenVLBase):
             },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("RESPONSE",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("RESPONSE", "reasoning_content")
     FUNCTION = "process"
     CATEGORY = "🧪AILab/QwenVL"
 
@@ -956,9 +958,8 @@ class AILab_QwenVL_Advanced(QwenVLBase):
         load_model_configs()
         models = list(HF_VL_MODELS.keys())
         default_model = models[0] if models else "Qwen3-VL-4B-Instruct"
-        prompts = PRESET_PROMPTS or ["Describe this image in detail."]
-        preferred_prompt = "🖼️ Detailed Description"
-        default_prompt = preferred_prompt if preferred_prompt in prompts else prompts[0]
+        prompts = PRESET_PROMPTS or ["none"]
+        default_prompt = "none" if "none" in prompts else prompts[0]
 
         num_gpus = torch.cuda.device_count()
         gpu_list = [f"cuda:{i}" for i in range(num_gpus)]
@@ -975,13 +976,14 @@ class AILab_QwenVL_Advanced(QwenVLBase):
                 "system_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": "Custom system prompt. Leave empty for the default VL assistant prompt."}),
                 "user_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": "User instruction. If filled, this is used instead of preset/custom prompt."}),
                 "custom_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": TOOLTIPS["custom_prompt"]}),
+                "token_preset": (TOKEN_PRESETS, {"default": "16k", "tooltip": "Quick generation budget: 16k, 32k, or 64k tokens."}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.1, "max": 1.0, "tooltip": TOOLTIPS["temperature"]}),
                 "is_memory": (ENABLE_DISABLE, {"default": "disable", "tooltip": "When enable, keep prior turns on this node instance."}),
                 "is_tools_in_sys_prompt": (ENABLE_DISABLE, {"default": "disable"}),
                 "is_locked": (ENABLE_DISABLE, {"default": "disable", "tooltip": "When enable, skip generation and return the last response."}),
                 "main_brain": (ENABLE_DISABLE, {"default": "enable"}),
-                "max_length": ("INT", {"default": 1920, "min": 64, "max": 8192, "tooltip": "Maximum new tokens (same role as max_tokens)."}),
-                "max_tokens": ("INT", {"default": 512, "min": 64, "max": 4096, "tooltip": TOOLTIPS["max_tokens"]}),
+                "max_length": ("INT", {"default": 16384, "min": 64, "max": 65536, "tooltip": "Maximum new tokens. token_preset wins unless this is larger."}),
+                "max_tokens": ("INT", {"default": 16384, "min": 64, "max": 65536, "tooltip": TOOLTIPS["max_tokens"]}),
                 "conversation_rounds": ("INT", {"default": 1, "min": 1, "max": 32}),
                 "historical_record": ("STRING", {"default": "", "multiline": True}),
                 "is_enable": ("BOOLEAN", {"default": True}),
@@ -1012,8 +1014,8 @@ class AILab_QwenVL_Advanced(QwenVLBase):
             },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("RESPONSE",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("RESPONSE", "reasoning_content")
     FUNCTION = "process"
     CATEGORY = "🧪AILab/QwenVL"
 
@@ -1028,6 +1030,7 @@ class AILab_QwenVL_Advanced(QwenVLBase):
         system_prompt,
         user_prompt,
         custom_prompt,
+        token_preset,
         temperature,
         is_memory,
         is_tools_in_sys_prompt,
@@ -1062,9 +1065,9 @@ class AILab_QwenVL_Advanced(QwenVLBase):
         audio3=None,
     ):
         if not is_enable:
-            return ("",)
+            return ("", "")
         if flag_enabled(is_locked) and self.last_response:
-            return (self.last_response,)
+            return (self.last_response, self.last_reasoning)
 
         labeled_images = collect_labeled_images(
             image=image, image1=image1, image2=image2, image3=image3, image4=image4, image5=image5
@@ -1085,7 +1088,7 @@ class AILab_QwenVL_Advanced(QwenVLBase):
             main_brain=main_brain,
             is_tools_in_sys_prompt=is_tools_in_sys_prompt,
         )
-        token_budget = int(max_length) if int(max_length or 0) > 0 else int(max_tokens)
+        token_budget = max(parse_token_preset(token_preset), int(max_length or 0), int(max_tokens or 0))
 
         pbar = ProgressBar(3)
         torch.manual_seed(seed)
@@ -1100,7 +1103,7 @@ class AILab_QwenVL_Advanced(QwenVLBase):
         )
         pbar.update_absolute(2, 3, None)
         try:
-            text = self.generate(
+            text, reasoning = self.generate(
                 prompt_text,
                 None,
                 None,
@@ -1117,10 +1120,11 @@ class AILab_QwenVL_Advanced(QwenVLBase):
             )
             pbar.update_absolute(3, 3, None)
             self.last_response = text
+            self.last_reasoning = reasoning
             if flag_enabled(is_memory):
                 self.conversation_memory.append({"user": user_text, "assistant": text})
             _ = stream
-            return (text,)
+            return (text, reasoning)
         finally:
             if not keep_model_loaded:
                 self.clear()

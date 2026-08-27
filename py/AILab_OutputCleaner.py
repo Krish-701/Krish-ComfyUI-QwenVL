@@ -38,6 +38,41 @@ _PLANNING_RE = re.compile(
 )
 
 
+def extract_reasoning_content(text: str, extra: str | None = None) -> str:
+    """Pull model reasoning from <think> blocks and optional API reasoning_content."""
+    parts: list[str] = []
+    extra_text = (extra or "").strip()
+    if extra_text:
+        parts.append(extra_text)
+    raw = text or ""
+    for match in re.finditer(r"<think[^>]*>(.*?)</think>", raw, flags=re.IGNORECASE | re.DOTALL):
+        inner = (match.group(1) or "").strip()
+        if inner:
+            parts.append(inner)
+    if not parts:
+        open_m = _THINK_OPEN_RE.search(raw)
+        if open_m:
+            after = raw[open_m.end() :]
+            close_m = _THINK_CLOSE_RE.search(after)
+            body = after[: close_m.start()] if close_m else after
+            body = body.strip()
+            if body:
+                parts.append(body)
+    seen = set()
+    unique = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return "\n\n".join(unique).strip()
+
+
+def split_response_and_reasoning(text: str, extra_reasoning: str | None = None, mode: str = "text") -> tuple[str, str]:
+    reasoning = extract_reasoning_content(text, extra_reasoning)
+    cleaned = clean_model_output(text, OutputCleanConfig(mode=mode, strip_think=True))
+    return cleaned.strip(), reasoning
+
+
 def clean_model_output(text: str, config: OutputCleanConfig | None = None) -> str:
     if not text:
         return ""

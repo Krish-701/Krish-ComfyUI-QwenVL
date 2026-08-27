@@ -13,7 +13,7 @@
         "Qwen3-4B-Q8_0.gguf"
       ],
       "defaults": {
-        "context_length": 8192
+        "context_length": 65536
       }
     },
     "Qwen3-4B-abliterated-GGUF": {
@@ -34,7 +34,7 @@
         "Qwen3-4B-abliterated-f16_q8_0.gguf"
       ],
       "defaults": {
-        "context_length": 8192
+        "context_length": 65536
       }
     }
   },
@@ -50,8 +50,8 @@
         "Qwen3VL-4B-Instruct-F16.gguf"
       ],
       "defaults": {
-        "context_length": 8192,
-        "image_max_tokens": 4096,
+        "context_length": 65536,
+        "image_max_tokens": 16384,
         "n_batch": 512,
         "gpu_layers": -1,
         "top_k": 0,
@@ -69,8 +69,8 @@
         "Qwen3VL-8B-Instruct-F16.gguf"
       ],
       "defaults": {
-        "context_length": 8192,
-        "image_max_tokens": 4096,
+        "context_length": 65536,
+        "image_max_tokens": 16384,
         "n_batch": 512,
         "gpu_layers": -1,
         "top_k": 0,
@@ -88,8 +88,8 @@
         "Qwen3VL-4B-Thinking-F16.gguf"
       ],
       "defaults": {
-        "context_length": 8192,
-        "image_max_tokens": 4096,
+        "context_length": 65536,
+        "image_max_tokens": 16384,
         "n_batch": 512,
         "gpu_layers": -1,
         "top_k": 0,
@@ -107,8 +107,8 @@
         "Qwen3VL-8B-Thinking-F16.gguf"
       ],
       "defaults": {
-        "context_length": 8192,
-        "image_max_tokens": 4096,
+        "context_length": 65536,
+        "image_max_tokens": 16384,
         "n_batch": 512,
         "gpu_layers": -1,
         "top_k": 0,
@@ -124,8 +124,8 @@
         "Qwen3.5-4B-UD-Q4_K_XL.gguf"
       ],
       "defaults": {
-        "context_length": 8192,
-        "image_max_tokens": 4096,
+        "context_length": 65536,
+        "image_max_tokens": 16384,
         "n_batch": 512,
         "gpu_layers": -1,
         "top_k": 0,
@@ -141,8 +141,8 @@
         "Qwen3.6-27B-UD-Q3_K_XL.gguf"
       ],
       "defaults": {
-        "context_length": 8192,
-        "image_max_tokens": 4096,
+        "context_length": 65536,
+        "image_max_tokens": 16384,
         "n_batch": 512,
         "gpu_layers": -1,
         "top_k": 0,
@@ -159,8 +159,8 @@
         "Qwen3.8-27B-Q8_0.gguf"
       ],
       "defaults": {
-        "context_length": 8192,
-        "image_max_tokens": 4096,
+        "context_length": 65536,
+        "image_max_tokens": 16384,
         "n_batch": 512,
         "gpu_layers": -1,
         "top_k": 0,
