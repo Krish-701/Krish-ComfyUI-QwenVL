@@ -16,6 +16,7 @@ import inspect
 import json
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -264,9 +265,36 @@ class QwenVLGGUFBase:
     def _load_backend(self):
         try:
             from llama_cpp import Llama  # noqa: F401
+            return
+        except Exception:
+            pass
+
+        print("[QwenVL] llama_cpp not found in this ComfyUI Python. Auto-installing vision wheel...")
+        try:
+            from llama_cpp_install import ensure_llama_cpp_vision
+
+            installed = ensure_llama_cpp_vision()
         except Exception as exc:
             raise RuntimeError(
-                "[QwenVL] llama_cpp is not available. Install the GGUF vision dependency first. See docs/GGUF_MANUAL_INSTALL.md"
+                "[QwenVL] llama_cpp auto-install failed. "
+                "Run docs/install_llama_cpp_vision.py with ComfyUI's python_embeded/python.exe. "
+                f"Details: {exc}"
+            ) from exc
+
+        if not installed:
+            raise RuntimeError(
+                "[QwenVL] llama_cpp is not available in this ComfyUI Python.\n"
+                f"  Interpreter: {sys.executable}\n"
+                "  The node tried to auto-install a vision wheel and it did not succeed.\n"
+                "  Close ComfyUI, then run:\n"
+                f"    {sys.executable} custom_nodes/Krish-ComfyUI-QwenVL/docs/install_llama_cpp_vision.py"
+            )
+
+        try:
+            from llama_cpp import Llama  # noqa: F401
+        except Exception as exc:
+            raise RuntimeError(
+                "[QwenVL] llama_cpp installed but still cannot import. Fully restart ComfyUI, then retry."
             ) from exc
 
     def _load_model(

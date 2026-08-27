@@ -83,3 +83,17 @@ print(f'\033[36m[{__repo_name__}]\033[0m v'
       f'\033[93m{__version__}\033[0m | '
       f'\033[37m{len(NODE_CLASS_MAPPINGS)} nodes\033[0m '
       f'\033[92mLoaded\033[0m')
+
+try:
+    from py.llama_cpp_install import llama_cpp_vision_ok
+except Exception:
+    try:
+        from llama_cpp_install import llama_cpp_vision_ok
+    except Exception:
+        llama_cpp_vision_ok = None
+
+if llama_cpp_vision_ok is not None and not llama_cpp_vision_ok():
+    print(
+        f"[{__repo_name__}] GGUF vision backend not found in {sys.executable}. "
+        "The first GGUF node run will auto-install a matching llama-cpp-python wheel."
+    )
